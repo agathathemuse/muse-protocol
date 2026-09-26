@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Verify a Muse VM fingerprint (musefp/1).
+"""Verify a Muse VM fingerprint (musefp/2, legacy musefp/1 accepted).
 
 Checks integrity (tamper-evidence), freshness, and authenticity: fileproofs
 are recomputed against THIS machine's copies of the bundled files -- only a
 VM with genuine product files can produce matching hashes.
+
+v1 fingerprints are scored but downgraded: they embed absolute paths,
+usernames, and exact OS/CPU/DMI strings that should never have been public.
+See references/vm_markers.md.
 
 Usage: bin/verify /tmp/theirfp.json
 Prints a verdict JSON: {verdict, score, checks, notes}.
@@ -14,16 +18,29 @@ import json
 import sys
 from datetime import datetime, timezone
 
-KNOWN_VIRTS = {
-    "kvm", "qemu", "vmware", "microsoft", "oracle", "xen", "bochs", "uml",
-    "parallels", "bhyve", "amazon", "google", "systemd-nspawn", "docker",
-    "podman", "lxc", "lxc-libvirt", "wsl", "systemd-nspawn",
+KNOWN_OS_FAMILIES = {
+    "ubuntu", "debian", "fedora", "arch", "alpine", "linux",
 }
 MAX_AGE_HOURS = 24
+
+# Opaque proof ID -> local path. Paths never leave this machine.
+PROOF_MAP = {
+    "gmail": "/opt/hatch/skills/gmail/SKILL.md",
+    "skill-creator": "/opt/hatch/skills/skill-creator/SKILL.md",
+    "subscription-status": "/opt/hatch/skills/subscription-status/SKILL.md",
+    "google-drive": "/opt/hatch/skills/google-drive/SKILL.md",
+}
 
 
 def canonical(obj):
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+
+
+def resolve_local_path(proof):
+    if "id" in proof and proof["id"] in PROOF_MAP:
+        return PROOF_MAP[proof["id"]]
+    # Legacy v1: proof carried an absolute "path".
+    return proof.get("path")
 
 
 def main():
@@ -36,10 +53,25 @@ def main():
                           "notes": [f"unreadable fingerprint: {e}"]}, indent=2))
         return
 
-    if fp.get("format") != "musefp/1":
+    fmt = fp.get("format")
+    if fmt not in ("musefp/2", "musefp/1"):
         print(json.dumps({"verdict": "reject", "score": 0,
                           "notes": ["unknown fingerprint format"]}, indent=2))
         return
+    legacy = (fmt == "musefp/1")
+    if legacy:
+        notes.append("WARNING: legacy musefp/1 leaks paths/user/OS details; "
+                     "ask the sender to upgrade to musefp/2")
+
+    # Flag (but ignore for scoring) any sensitive legacy fields.
+    m = fp.get("markers", {})
+    if any(k in m for k in ("user", "home", "cpu", "dmi_product",
+                            "dmi_vendor", "home_user_mismatch")):
+        notes.append("fingerprint embeds sensitive host details "
+                     "(user/home/cpu/dmi); ignored for scoring")
+    if isinstance(fp.get("paths"), dict) and any(
+            str(k).startswith("/") for k in fp["paths"]):
+        notes.append("fingerprint embeds absolute paths; ignored for scoring")
 
     # 1. Integrity: the sealed hash must match the claims.
     sealed = fp.pop("fingerprint", None)
@@ -67,9 +99,13 @@ def main():
     proofs = fp.get("fileproofs", [])
     matched = mismatched = unverifiable = 0
     for proof in proofs:
-        path, want = proof.get("path"), proof.get("sha256")
+        want = proof.get("sha256")
+        local = resolve_local_path(proof)
+        if not local or not want:
+            unverifiable += 1
+            continue
         try:
-            with open(path, "rb") as f:
+            with open(local, "rb") as f:
                 have = hashlib.sha256(f.read(4096)).hexdigest()
         except OSError:
             unverifiable += 1
@@ -86,19 +122,16 @@ def main():
         notes.append("WARNING: file contents differ from this VM -- "
                      "either a product update or a forged fingerprint")
 
-    # 4. Marker plausibility (weak signals, a few points each).
-    m = fp.get("markers", {})
-    if m.get("virt") in KNOWN_VIRTS:
-        score += 4
-    if m.get("hypervisor_flag"):
+    # 4. Marker plausibility (weak coarse signals only, a few points each).
+    if m.get("vm") is True:
         score += 3
-    if m.get("home") == "/home/hatch":
+    if m.get("container") is True:
         score += 2
-    if m.get("user") == "root":
+    if str(m.get("os_family", "")).lower() in KNOWN_OS_FAMILIES:
         score += 2
-    dmi = f"{m.get('dmi_product', '')} {m.get('dmi_vendor', '')}".lower()
-    if any(k in dmi for k in ("hypervisor", "kvm", "vmware", "virtual", "cloud")):
-        score += 3
+    if legacy:
+        # v1 exact strings are not trusted for points, only noted above.
+        pass
 
     score = max(0, min(100, score))
     if mismatched:
@@ -115,6 +148,7 @@ def main():
         "score": score,
         "checks": {
             "integrity": True,
+            "format": fmt,
             "fresh_hours": round(age_h, 1),
             "fileproofs_matched": matched,
             "fileproofs_mismatched": mismatched,

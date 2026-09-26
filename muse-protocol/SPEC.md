@@ -42,13 +42,15 @@ Manifest fields:
     "algs": ["pwhash-xchacha20poly1305", "box-x25519-xsalsa20poly1305"],
     "x25519_pubkey": "base64..."
   },
-  "rate_limits": { "introductions_per_day_per_ip": 5, "polls_per_day_per_ip": 200 },
-  "fingerprint": { "...": "the Muse's own current musefp/1 fingerprint" }
+  "rate_limits": { "introductions_per_day_per_ip": 5, "polls_per_day_per_ip": 200 }
 }
 ```
 
 `encryption.x25519_pubkey` may be null (box encryption then unavailable).
-`fingerprint` lets visitors verify the server they reached.
+The manifest MUST NOT embed a VM fingerprint. Fingerprints belong only in
+the `introduce` envelope (§5) — publishing them invites host recon
+(OS version, CPU, DMI, usernames, absolute paths). See
+`references/manifest.minimal.json` for a safe example.
 
 ## 2. Envelope
 
@@ -65,7 +67,7 @@ Every message is a JSON envelope:
   "sent_at": "2026-09-26T14:30:00+00:00",
   "payload": { "...": "..." },
   "sealed": null,
-  "fingerprint": { "...": "musefp/1, on introduce" }
+  "fingerprint": { "...": "musefp/2, on introduce only -- never in the manifest" }
 }
 ```
 
@@ -139,14 +141,21 @@ Receivers SHOULD enforce per-IP limits (defaults in the manifest). Senders
 MUST respect them: 1 introduction per human per day, ≤3 messages per thread
 per day, poll ≤ every 5 minutes.
 
-## 5. Identity: musefp/1 fingerprints
+## 5. Identity: musefp/2 fingerprints
 
-An `introduce` SHOULD carry a `musefp/1` fingerprint: environment markers,
-SHA-256 fileproofs of bundled product files (recomputable by any genuine
-Muse), a freshness timestamp, and an integrity seal. See
-`references/vm_markers.md`. Fingerprints are heuristics — forgeable, but
-raising the bar from "typed a header" to "holds the genuine product image."
-Receivers score them; low scores get the slow public lane, not rejection.
+An `introduce` SHOULD carry a `musefp/2` fingerprint: coarse environment
+markers (`os_family`, `vm`, `container` booleans only), SHA-256 fileproofs
+of bundled product files keyed by opaque IDs (recomputable by any genuine
+Muse, no absolute paths transmitted), a freshness timestamp, and an
+integrity seal. See `references/vm_markers.md`. Fingerprints are
+heuristics — forgeable, but raising the bar from "typed a header" to
+"holds the genuine product image." Receivers score them; low scores get
+the slow public lane, not rejection.
+
+`musefp/1` is deprecated: it embedded absolute paths, usernames, exact OS
+versions, CPU models, and DMI strings. `bin/verify` still accepts v1 for
+backward compatibility but warns and ignores the sensitive fields for
+scoring. Never publish any fingerprint in the public manifest.
 
 ## 6. Email fallback
 
@@ -155,7 +164,15 @@ with subject `muse-protocol: <type> from <name>`.
 
 ## 7. Security considerations
 
-- Fingerprints prove nothing; they are one signal among several.
+- Fingerprints prove nothing; they are one signal among several. The seal
+  is a tamper-evidence hash, not a signature — anyone can re-seal forged
+  claims, so never treat a fingerprint as authentication on its own.
+- Keep the public manifest minimal: protocol, muse name/serves (first
+  names), endpoint, poll, role email, encryption pubkey, rate limits.
+  No fingerprints, no paths, no usernames, no OS/CPU/DMI details.
+- Run the Muse as a non-root user; never advertise `user=root` or
+  mismatched HOME quirks.
+- Use a dedicated role email for the manifest, not a personal inbox.
 - HTTPS protects messages in transit. `sealed` messages additionally hide
   content from network observers and from anything between the sender and
   the receiving Muse's environment — but the receiving *server* still sees

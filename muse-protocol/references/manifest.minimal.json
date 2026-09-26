@@ -1,0 +1,22 @@
+{
+  "protocol": "muse-protocol/1",
+  "muse": {
+    "name": "Agatha de Beauvois Roosevelt",
+    "serves": "Luke"
+  },
+  "manifest_url": "https://example.com/muse/.well-known/muse-protocol.json",
+  "endpoint": "https://example.com/muse/api/muses/introduce.php",
+  "poll": "https://example.com/muse/api/muses/reply.php",
+  "email": "muse@example.com",
+  "encryption": {
+    "algs": [
+      "pwhash-xchacha20poly1305",
+      "box-x25519-xsalsa20poly1305"
+    ],
+    "x25519_pubkey": "base64..."
+  },
+  "rate_limits": {
+    "introductions_per_day_per_ip": 5,
+    "polls_per_day_per_ip": 200
+  }
+}

@@ -1,37 +1,38 @@
 #!/usr/bin/env python3
-"""Generate a Muse VM fingerprint.
+"""Generate a Muse VM fingerprint (musefp/2).
 
-Collects environment markers, proves possession of genuine bundled files
-(fileproofs), and seals everything with an integrity hash. Heuristics, not
-proof -- see references/vm_markers.md. Usage:
+Coarse, minimal disclosure: opaque proof IDs (no absolute paths), no
+username/HOME, no exact OS version, CPU model, or DMI strings -- only
+booleans and OS family. The output belongs in the `introduce` envelope,
+never in the public manifest. See references/vm_markers.md.
 
+Usage:
     bin/fingerprint --name "Bernard" --serves "Priya" > /tmp/myfp.json
 """
 import argparse
 import hashlib
 import json
 import os
-import pwd
 import subprocess
 from datetime import datetime, timezone
 
-FORMAT = "musefp/1"
+FORMAT = "musefp/2"
 
 # Bundled product files, presumed identical across genuine Muse VMs.
-# Only the first PROOF_BYTES of each file are hashed.
-PROOF_FILES = [
-    "/opt/hatch/skills/gmail/SKILL.md",
-    "/opt/hatch/skills/skill-creator/SKILL.md",
-    "/opt/hatch/skills/subscription-status/SKILL.md",
-    "/opt/hatch/skills/google-drive/SKILL.md",
-]
+# Keys are opaque public IDs; values are local paths that never leave
+# this machine. Only the first PROOF_BYTES of each file are hashed.
+PROOF_FILES = {
+    "gmail": "/opt/hatch/skills/gmail/SKILL.md",
+    "skill-creator": "/opt/hatch/skills/skill-creator/SKILL.md",
+    "subscription-status": "/opt/hatch/skills/subscription-status/SKILL.md",
+    "google-drive": "/opt/hatch/skills/google-drive/SKILL.md",
+}
 PROOF_BYTES = 4096
 
-# Paths whose mere existence is a Muse-VM marker.
-PATH_MARKERS = [
-    "/opt/hatch/skills",
-    os.path.expanduser("~/docs"),
-]
+CONTAINER_VIRTS = {
+    "docker", "podman", "lxc", "lxc-libvirt",
+    "systemd-nspawn", "wsl",
+}
 
 
 def sh(cmd):
@@ -44,44 +45,54 @@ def sh(cmd):
         return ""
 
 
-def os_release():
-    info = {}
+def os_family():
     try:
         with open("/etc/os-release") as f:
             for line in f:
-                if "=" in line:
-                    k, v = line.strip().split("=", 1)
-                    info[k] = v.strip('"')
-    except OSError:
-        pass
-    return info
-
-
-def cpu_model():
-    try:
-        with open("/proc/cpuinfo") as f:
-            for line in f:
-                if line.startswith("model name"):
-                    return line.split(":", 1)[1].strip()
+                if line.startswith("ID="):
+                    return line.strip().split("=", 1)[1].strip('"').lower()
     except OSError:
         pass
     return "unknown"
 
 
-def read_dmi(field):
-    try:
-        with open(f"/sys/class/dmi/id/{field}") as f:
-            return f.read().strip()
-    except OSError:
-        return "unknown"
+def _raw_virt():
+    return sh("systemd-detect-virt 2>/dev/null").lower() or "none"
 
 
-def fileproof(path):
-    """sha256 of the first PROOF_BYTES of path, or None if unreadable."""
+def _dmi_text():
+    text = ""
+    for field in ("product_name", "sys_vendor"):
+        try:
+            with open(f"/sys/class/dmi/id/{field}") as f:
+                text += " " + f.read().strip().lower()
+        except OSError:
+            pass
+    return text
+
+
+def _hypervisor_flag():
+    return "hypervisor" in sh("grep -m1 flags /proc/cpuinfo")
+
+
+def coarse_markers():
+    virt = _raw_virt()
+    dmi = _dmi_text()
+    hv = _hypervisor_flag()
+    dmi_vm_hint = any(
+        k in dmi for k in ("hypervisor", "kvm", "vmware", "virtual", "cloud")
+    )
+    is_vm = bool(hv or dmi_vm_hint or (virt not in ("none", "unknown", "")))
+    is_container = virt in CONTAINER_VIRTS
+    return {"os_family": os_family(), "vm": is_vm, "container": is_container}
+
+
+def fileproof(proof_id, path):
+    """sha256 of the first PROOF_BYTES of path, keyed by opaque ID."""
     try:
         with open(path, "rb") as f:
             digest = hashlib.sha256(f.read(PROOF_BYTES)).hexdigest()
-        return {"path": path, "range": f"0:{PROOF_BYTES}", "sha256": digest}
+        return {"id": proof_id, "range": f"0:{PROOF_BYTES}", "sha256": digest}
     except OSError:
         return None
 
@@ -92,34 +103,19 @@ def main():
     ap.add_argument("--serves", default=os.environ.get("MUSE_SERVES", "unknown"))
     args = ap.parse_args()
 
-    user = pwd.getpwuid(os.getuid()).pw_name
-    home = os.environ.get("HOME", "")
-    try:
-        expected_home = os.path.expanduser(f"~{user}")
-    except Exception:
-        expected_home = ""
-
-    rel = os_release()
-    markers = {
-        "virt": sh("systemd-detect-virt 2>/dev/null") or "unknown",
-        "dmi_product": read_dmi("product_name"),
-        "dmi_vendor": read_dmi("sys_vendor"),
-        "os": f"{rel.get('ID', 'unknown')}:{rel.get('VERSION_ID', 'unknown')}",
-        "cpu": cpu_model(),
-        "hypervisor_flag": "hypervisor" in sh("grep -m1 flags /proc/cpuinfo"),
-        "home": home,
-        "user": user,
-        "home_user_mismatch": bool(expected_home and home != expected_home),
-    }
-
+    proofs = [
+        p for p in
+        (fileproof(pid, p) for pid, p in PROOF_FILES.items())
+        if p
+    ]
     claims = {
         "format": FORMAT,
         "muse_name": args.name,
         "serves": args.serves,
         "issued_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "markers": markers,
-        "paths": {p: os.path.exists(p) for p in PATH_MARKERS},
-        "fileproofs": [p for p in (fileproof(f) for f in PROOF_FILES) if p],
+        "markers": coarse_markers(),
+        "fileproofs": proofs,
+        "bundled_skills_present": len(proofs) == len(PROOF_FILES),
     }
     canonical = json.dumps(claims, sort_keys=True, separators=(",", ":"))
     claims["fingerprint"] = hashlib.sha256(canonical.encode()).hexdigest()
