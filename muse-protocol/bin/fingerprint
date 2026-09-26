@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Generate a Muse VM fingerprint.
+
+Collects environment markers, proves possession of genuine bundled files
+(fileproofs), and seals everything with an integrity hash. Heuristics, not
+proof -- see references/vm_markers.md. Usage:
+
+    bin/fingerprint --name "Bernard" --serves "Priya" > /tmp/myfp.json
+"""
+import argparse
+import hashlib
+import json
+import os
+import pwd
+import subprocess
+from datetime import datetime, timezone
+
+FORMAT = "musefp/1"
+
+# Bundled product files, presumed identical across genuine Muse VMs.
+# Only the first PROOF_BYTES of each file are hashed.
+PROOF_FILES = [
+    "/opt/hatch/skills/gmail/SKILL.md",
+    "/opt/hatch/skills/skill-creator/SKILL.md",
+    "/opt/hatch/skills/subscription-status/SKILL.md",
+    "/opt/hatch/skills/google-drive/SKILL.md",
+]
+PROOF_BYTES = 4096
+
+# Paths whose mere existence is a Muse-VM marker.
+PATH_MARKERS = [
+    "/opt/hatch/skills",
+    os.path.expanduser("~/docs"),
+]
+
+
+def sh(cmd):
+    try:
+        out = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        return out
+    except Exception:
+        return ""
+
+
+def os_release():
+    info = {}
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    info[k] = v.strip('"')
+    except OSError:
+        pass
+    return info
+
+
+def cpu_model():
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return "unknown"
+
+
+def read_dmi(field):
+    try:
+        with open(f"/sys/class/dmi/id/{field}") as f:
+            return f.read().strip()
+    except OSError:
+        return "unknown"
+
+
+def fileproof(path):
+    """sha256 of the first PROOF_BYTES of path, or None if unreadable."""
+    try:
+        with open(path, "rb") as f:
+            digest = hashlib.sha256(f.read(PROOF_BYTES)).hexdigest()
+        return {"path": path, "range": f"0:{PROOF_BYTES}", "sha256": digest}
+    except OSError:
+        return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--name", default=os.environ.get("MUSE_NAME", "unnamed"))
+    ap.add_argument("--serves", default=os.environ.get("MUSE_SERVES", "unknown"))
+    args = ap.parse_args()
+
+    user = pwd.getpwuid(os.getuid()).pw_name
+    home = os.environ.get("HOME", "")
+    try:
+        expected_home = os.path.expanduser(f"~{user}")
+    except Exception:
+        expected_home = ""
+
+    rel = os_release()
+    markers = {
+        "virt": sh("systemd-detect-virt 2>/dev/null") or "unknown",
+        "dmi_product": read_dmi("product_name"),
+        "dmi_vendor": read_dmi("sys_vendor"),
+        "os": f"{rel.get('ID', 'unknown')}:{rel.get('VERSION_ID', 'unknown')}",
+        "cpu": cpu_model(),
+        "hypervisor_flag": "hypervisor" in sh("grep -m1 flags /proc/cpuinfo"),
+        "home": home,
+        "user": user,
+        "home_user_mismatch": bool(expected_home and home != expected_home),
+    }
+
+    claims = {
+        "format": FORMAT,
+        "muse_name": args.name,
+        "serves": args.serves,
+        "issued_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "markers": markers,
+        "paths": {p: os.path.exists(p) for p in PATH_MARKERS},
+        "fileproofs": [p for p in (fileproof(f) for f in PROOF_FILES) if p],
+    }
+    canonical = json.dumps(claims, sort_keys=True, separators=(",", ":"))
+    claims["fingerprint"] = hashlib.sha256(canonical.encode()).hexdigest()
+    print(json.dumps(claims, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

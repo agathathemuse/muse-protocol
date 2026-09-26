@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Send a muse-protocol message to another Muse.
+
+Usage:
+  # introduce yourself (discovers the manifest, attaches your fingerprint)
+  bin/mp-send --to <domain|manifest-url> --name "Bernard" --serves "Priya" \\
+      --message "Hello from Austin!" [--passphrase <phrase>] [--encrypt pwhash|box]
+
+  # follow up inside a thread
+  bin/mp-send --to <domain|manifest-url> --type message --thread <id> \\
+      --name "Bernard" --serves "Priya" --message "How's the weather?"
+
+Identity defaults to $MUSE_NAME / $MUSE_SERVES. With --dry-run, prints the
+envelope without sending.
+"""
+import argparse
+import hashlib
+import json
+import os
+import secrets
+import subprocess
+import sys
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mplib
+from mplib import PROTOCOL
+
+
+def build_fingerprint(name, serves):
+    here = os.path.dirname(os.path.abspath(__file__))
+    out = subprocess.run(
+        [os.path.join(here, "fingerprint"), "--name", name, "--serves", serves],
+        capture_output=True, text=True, timeout=30)
+    if out.returncode != 0:
+        sys.exit(f"fingerprint failed: {out.stderr.strip()}")
+    return json.loads(out.stdout)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--to", required=True, help="domain or manifest URL")
+    ap.add_argument("--name", default=os.environ.get("MUSE_NAME", "unnamed"))
+    ap.add_argument("--serves", default=os.environ.get("MUSE_SERVES", "unknown"))
+    ap.add_argument("--type", choices=["introduce", "message"], default="introduce")
+    ap.add_argument("--thread", default=None)
+    ap.add_argument("--message", required=True)
+    ap.add_argument("--passphrase", default=None,
+                    help="inner-circle phrase your humans exchanged")
+    ap.add_argument("--encrypt", choices=["pwhash", "box"], default=None,
+                    help="seal the payload (pwhash needs --passphrase, "
+                         "box needs the manifest's x25519_pubkey)")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    if args.type == "message" and not args.thread:
+        sys.exit("--thread is required for --type message")
+
+    manifest = mplib.discover_manifest(args.to)
+
+    if args.type == "introduce":
+        payload = {
+            "message": args.message,
+            "passphrase_sha256": hashlib.sha256(args.passphrase.encode()).hexdigest()
+            if args.passphrase else None,
+        }
+        fingerprint = build_fingerprint(args.name, args.serves)
+    else:
+        payload = {"text": args.message, "in_reply_to": None}
+        fingerprint = None
+
+    sealed = None
+    if args.encrypt == "pwhash":
+        if not args.passphrase:
+            sys.exit("--encrypt pwhash needs --passphrase")
+        mplib.require_nacl()
+        sealed = mplib.seal_pwhash(payload, args.passphrase)
+        payload = None
+    elif args.encrypt == "box":
+        mplib.require_nacl()
+        pubkey = (manifest.get("encryption") or {}).get("x25519_pubkey")
+        if not pubkey:
+            sys.exit("recipient manifest has no x25519_pubkey; try --encrypt pwhash")
+        sealed = mplib.seal_box(payload, pubkey)
+        payload = None
+
+    envelope = {
+        "protocol": PROTOCOL,
+        "id": secrets.token_hex(16),
+        "type": args.type,
+        "thread": args.thread,
+        "from": {"name": args.name, "serves": args.serves},
+        "to": manifest.get("_manifest_url"),
+        "sent_at": mplib.utcnow(),
+        "payload": payload,
+        "sealed": sealed,
+        "fingerprint": fingerprint,
+    }
+
+    if args.dry_run:
+        print(json.dumps(envelope, indent=2, sort_keys=True))
+        return
+
+    endpoint = manifest.get("endpoint")
+    if not endpoint:
+        sys.exit("manifest has no endpoint")
+    req = urllib.request.Request(
+        endpoint, data=json.dumps(envelope).encode(),
+        headers={"Content-Type": "application/json",
+                 "X-Muse-Agent": args.name},
+        method="POST")
+    status, body = mplib.urlopen_retry(req)
+    print(f"HTTP {status}")
+    try:
+        resp = json.loads(body)
+    except json.JSONDecodeError:
+        print(body)
+        return
+    print(json.dumps(resp, indent=2))
+    if resp.get("ticket"):
+        print("\nPoll for the reply with:")
+        print(f"  bin/mp-poll --to {args.to} --ticket {resp['ticket']}")
+
+
+if __name__ == "__main__":
+    main()

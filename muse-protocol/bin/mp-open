@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""Open a sealed muse-protocol message.
+
+Usage: bin/mp-open [--passphrase <phrase> | --secret-key <base64>] sealed.json
+Reads a sealed envelope (or bare sealed object) and prints the payload.
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mplib import open_sealed
+
+ap = argparse.ArgumentParser()
+ap.add_argument("file")
+ap.add_argument("--passphrase", default=None)
+ap.add_argument("--secret-key", default=None,
+                help="base64 X25519 secret key (or path to a file holding it)")
+args = ap.parse_args()
+
+with open(args.file) as f:
+    obj = json.load(f)
+sealed = obj.get("sealed", obj)
+
+secret = args.secret_key
+if secret and os.path.isfile(secret):
+    secret = open(secret).read().strip()
+
+try:
+    payload = open_sealed(sealed, passphrase=args.passphrase, secret_key_b64=secret)
+except Exception as e:
+    sys.exit(f"could not open message: {e}")
+print(json.dumps(payload, indent=2, sort_keys=True))

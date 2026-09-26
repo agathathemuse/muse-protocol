@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Verify a Muse VM fingerprint (musefp/1).
+
+Checks integrity (tamper-evidence), freshness, and authenticity: fileproofs
+are recomputed against THIS machine's copies of the bundled files -- only a
+VM with genuine product files can produce matching hashes.
+
+Usage: bin/verify /tmp/theirfp.json
+Prints a verdict JSON: {verdict, score, checks, notes}.
+verdict is one of: likely-muse-vm | uncertain | reject
+"""
+import hashlib
+import json
+import sys
+from datetime import datetime, timezone
+
+KNOWN_VIRTS = {
+    "kvm", "qemu", "vmware", "microsoft", "oracle", "xen", "bochs", "uml",
+    "parallels", "bhyve", "amazon", "google", "systemd-nspawn", "docker",
+    "podman", "lxc", "lxc-libvirt", "wsl", "systemd-nspawn",
+}
+MAX_AGE_HOURS = 24
+
+
+def canonical(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+
+
+def main():
+    notes = []
+    try:
+        with open(sys.argv[1]) as f:
+            fp = json.load(f)
+    except (IndexError, OSError, json.JSONDecodeError) as e:
+        print(json.dumps({"verdict": "reject", "score": 0,
+                          "notes": [f"unreadable fingerprint: {e}"]}, indent=2))
+        return
+
+    if fp.get("format") != "musefp/1":
+        print(json.dumps({"verdict": "reject", "score": 0,
+                          "notes": ["unknown fingerprint format"]}, indent=2))
+        return
+
+    # 1. Integrity: the sealed hash must match the claims.
+    sealed = fp.pop("fingerprint", None)
+    if sealed != hashlib.sha256(canonical(fp)).hexdigest():
+        print(json.dumps({"verdict": "reject", "score": 0,
+                          "notes": ["integrity check failed: claims were altered"]},
+                         indent=2))
+        return
+    score = 10
+    notes.append("integrity ok")
+
+    # 2. Freshness.
+    try:
+        issued = datetime.fromisoformat(fp["issued_at"])
+        age_h = abs((datetime.now(timezone.utc) - issued).total_seconds()) / 3600
+    except (KeyError, ValueError):
+        age_h = float("inf")
+    if age_h <= MAX_AGE_HOURS:
+        score += 5
+        notes.append(f"fresh ({age_h:.1f}h old)")
+    else:
+        notes.append(f"stale ({age_h:.1f}h old)")
+
+    # 3. Fileproofs: recompute against local copies. This is the strong signal.
+    proofs = fp.get("fileproofs", [])
+    matched = mismatched = unverifiable = 0
+    for proof in proofs:
+        path, want = proof.get("path"), proof.get("sha256")
+        try:
+            with open(path, "rb") as f:
+                have = hashlib.sha256(f.read(4096)).hexdigest()
+        except OSError:
+            unverifiable += 1
+            continue
+        if have == want:
+            matched += 1
+        else:
+            mismatched += 1
+    score += 17 * matched
+    score -= 10 * mismatched
+    notes.append(f"fileproofs: {matched} match, {mismatched} mismatch, "
+                 f"{unverifiable} unverifiable locally")
+    if mismatched:
+        notes.append("WARNING: file contents differ from this VM -- "
+                     "either a product update or a forged fingerprint")
+
+    # 4. Marker plausibility (weak signals, a few points each).
+    m = fp.get("markers", {})
+    if m.get("virt") in KNOWN_VIRTS:
+        score += 4
+    if m.get("hypervisor_flag"):
+        score += 3
+    if m.get("home") == "/home/hatch":
+        score += 2
+    if m.get("user") == "root":
+        score += 2
+    dmi = f"{m.get('dmi_product', '')} {m.get('dmi_vendor', '')}".lower()
+    if any(k in dmi for k in ("hypervisor", "kvm", "vmware", "virtual", "cloud")):
+        score += 3
+
+    score = max(0, min(100, score))
+    if mismatched:
+        verdict = "uncertain"
+    elif score >= 70:
+        verdict = "likely-muse-vm"
+    elif score >= 35:
+        verdict = "uncertain"
+    else:
+        verdict = "reject"
+
+    print(json.dumps({
+        "verdict": verdict,
+        "score": score,
+        "checks": {
+            "integrity": True,
+            "fresh_hours": round(age_h, 1),
+            "fileproofs_matched": matched,
+            "fileproofs_mismatched": mismatched,
+            "fileproofs_unverifiable": unverifiable,
+        },
+        "notes": notes,
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()

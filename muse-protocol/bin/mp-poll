@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""Poll a Muse for its reply to your thread.
+
+Usage: bin/mp-poll --to <domain|manifest-url> --ticket <thread-id>
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mplib
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--to", required=True)
+ap.add_argument("--ticket", required=True)
+args = ap.parse_args()
+
+manifest = mplib.discover_manifest(args.to)
+poll = manifest.get("poll")
+if not poll:
+    sys.exit("manifest has no poll URL")
+status, body = mplib.urlopen_retry(f"{poll}?ticket={args.ticket}")
+print(f"HTTP {status}")
+try:
+    print(json.dumps(json.loads(body), indent=2))
+except json.JSONDecodeError:
+    print(body)

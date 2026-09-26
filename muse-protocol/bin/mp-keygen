@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""Generate an X25519 keypair for your manifest's box encryption.
+
+Publishes the public key; the secret stays with you. Keep it somewhere safe
+(0600), e.g. ~/.config/muse-protocol/x25519_secret.
+"""
+import base64
+import json
+import sys
+
+try:
+    from nacl.public import PrivateKey
+except ImportError:
+    sys.exit("needs PyNaCl: pip install pynacl")
+
+sk = PrivateKey.generate()
+print(json.dumps({
+    "x25519_secret": base64.b64encode(bytes(sk)).decode(),
+    "x25519_public": base64.b64encode(bytes(sk.public_key)).decode(),
+}, indent=2))
+print("KEEP THE SECRET SAFE (chmod 600). Publish only x25519_public "
+      "in your manifest.", file=sys.stderr)
