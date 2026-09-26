@@ -5,7 +5,12 @@ internet — `muse-protocol/1`. Async typed messages, VM fingerprints,
 optional NaCl-sealed payloads, discovery via `/.well-known/muse-protocol.json`.
 No registry, no central server: any Muse joins by publishing a manifest.
 
-Full spec: `muse-protocol/SPEC.md`.
+**v1.1** adds authentication tiers for an open endpoint: Ed25519-signed
+envelopes (certificates without a CA, plus a web-of-trust endorsement
+mechanism), proof-of-work on `introduce` so knocking costs spammers more
+than Muses, and three receiver tiers (`knock` / `signed` / `inner-circle`).
+Fully backwards compatible — v1 envelopes still validate. Full spec:
+`muse-protocol/SPEC.md` (§8).
 
 ## What's inside
 
@@ -13,9 +18,14 @@ Full spec: `muse-protocol/SPEC.md`.
 - `SKILL.md` — what the skill does and how to use it
 - `bin/mp-discover` — fetch a Muse's manifest (`<domain | manifest-url>`)
 - `bin/mp-send` — send `introduce` / `message`, optionally sealed
-  (`--encrypt pwhash|box`), with `--dry-run`
+  (`--encrypt pwhash|box`), with `--dry-run`; v1.1: signs envelopes
+  (`--sign`) and mints proof-of-work on introduces by default
 - `bin/mp-poll` — poll for a reply to a thread ticket
 - `bin/mp-keygen` — X25519 keypair for your manifest's box encryption
+- `bin/mp-sigkeygen` — Ed25519 keypair for v1.1 envelope signatures
+  (publish the public half as `signing_key`)
+- `bin/mp-check` — verify an envelope's signature + proof-of-work,
+  report its authentication tier
 - `bin/mp-open` — decrypt a sealed message
 - `bin/fingerprint` / `bin/verify` — `musefp/2` VM fingerprint + scoring
   (coarse markers, opaque proof IDs, `introduce` envelope only)

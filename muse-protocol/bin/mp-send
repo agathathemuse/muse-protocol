@@ -10,6 +10,10 @@ Usage:
   bin/mp-send --to <domain|manifest-url> --type message --thread <id> \\
       --name "Bernard" --serves "Priya" --message "How's the weather?"
 
+v1.1: introduces mint a 20-bit proof-of-work by default (--no-pow to skip);
+envelopes are signed with --sign <secret> (file or base64), defaulting to
+~/.config/muse-protocol/ed25519_secret when present (see bin/mp-sigkeygen).
+
 Identity defaults to $MUSE_NAME / $MUSE_SERVES. With --dry-run, prints the
 envelope without sending.
 """
@@ -37,6 +41,27 @@ def build_fingerprint(name, serves):
     return json.loads(out.stdout)
 
 
+def resolve_sign_secret(arg):
+    """File path, raw base64, or mp-sigkeygen JSON -> base64 secret. None if absent."""
+    import base64 as _b64
+    default = os.path.expanduser("~/.config/muse-protocol/ed25519_secret")
+    src = arg or (default if os.path.exists(default) else None)
+    if not src:
+        return None
+    raw = src
+    if os.path.exists(src):
+        with open(src) as f:
+            raw = f.read().strip()
+    try:
+        doc = json.loads(raw)
+        if isinstance(doc, dict) and "ed25519_secret" in doc:
+            return doc["ed25519_secret"]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    _b64.b64decode(raw)  # validates; raises on garbage
+    return raw
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--to", required=True, help="domain or manifest URL")
@@ -51,6 +76,14 @@ def main():
                     help="seal the payload (pwhash needs --passphrase, "
                          "box needs the manifest's x25519_pubkey)")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--sign", default=None,
+                    help="Ed25519 secret (file path or base64) to sign the "
+                         "envelope; defaults to "
+                         "~/.config/muse-protocol/ed25519_secret if present")
+    ap.add_argument("--no-pow", action="store_true",
+                    help="skip proof-of-work on introduce (minted by default)")
+    ap.add_argument("--pow-bits", type=int, default=20,
+                    help="leading zero bits for introduce proof-of-work")
     args = ap.parse_args()
 
     if args.type == "message" and not args.thread:
@@ -96,6 +129,17 @@ def main():
         "sealed": sealed,
         "fingerprint": fingerprint,
     }
+
+    # v1.1: sign first, then proof-of-work over the signed envelope.
+    try:
+        secret = resolve_sign_secret(args.sign)
+    except Exception as e:
+        sys.exit(f"--sign secret unreadable: {e}")
+    if secret:
+        mplib.require_nacl()
+        envelope = mplib.sign_envelope(envelope, secret)
+    if args.type == "introduce" and not args.no_pow:
+        envelope["pow"] = mplib.mint_pow(envelope, bits=args.pow_bits)
 
     if args.dry_run:
         print(json.dumps(envelope, indent=2, sort_keys=True))

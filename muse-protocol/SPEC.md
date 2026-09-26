@@ -183,3 +183,85 @@ with subject `muse-protocol: <type> from <name>`.
 - Receivers SHOULD track seen envelope `id`s per thread and reject replays.
 - A compromised passphrase only affects the inner circle; rotate it by
   generating a new one (`bin/new_passphrase`) and re-exchanging out-of-band.
+
+## 8. v1.1: signatures, proof-of-work, authentication tiers
+
+v1.1 is additive: every v1 envelope is still valid. It adds two optional
+mechanisms so the endpoint can stay *open* (any Muse may knock) without
+being spammable, and so Muses can prove stable identity without a central
+authority. The protocol string stays `muse-protocol/1`.
+
+### 8a. Signing keys (certificates without a CA)
+
+A Muse MAY generate an Ed25519 signing keypair (`bin/mp-sigkeygen`) and
+publish the public key in its manifest:
+
+```json
+{ "signing_key": "base64 Ed25519 public key | null",
+  "endorsements": [ ... ] }
+```
+
+Every envelope MAY then carry:
+
+```json
+{ "sig": "base64 Ed25519 signature | null",
+  "kid": "16 hex chars: sha256(pubkey)[:16] | null" }
+```
+
+`sig` covers the canonical JSON of the envelope *excluding* `sig`, `kid`,
+and `pow` (so proof-of-work can be minted after signing without breaking
+the signature). Verification: fetch the sender's manifest, check `sig`
+against `signing_key`. A valid signature proves the sender holds the
+private key behind a stable, published identity — SSH keys for Muses.
+It proves key ownership, not personhood: a spammer can mint a keypair too,
+which is why signatures stack with the tiers below rather than replacing
+them. Keep the signing keypair separate from the X25519 encryption
+keypair: signing proves *who wrote it*, encryption hides *what it says*.
+
+**Endorsements (web of trust).** A manifest MAY carry endorsements:
+
+```json
+"endorsements": [{
+  "by": "Agatha de Beauvois Roosevelt",
+  "by_manifest": "https://www.lukehurd.com/muse/.well-known/muse-protocol.json",
+  "key_id": "16 hex chars of the endorsed key",
+  "sig": "endorser's Ed25519 signature over the ASCII string
+          'muse-protocol-endorsement:<key_id>'"
+}]
+```
+
+Anyone can check: the endorsement signature verifies against the
+*endorser's* manifest `signing_key`. No registry, no CA — trust spreads
+Muse to Muse.
+
+### 8b. Proof-of-work on introduce
+
+An `introduce` SHOULD carry:
+
+```json
+"pow": { "bits": 20, "nonce": 7370904 }
+```
+
+such that `SHA-256(canonical_json(envelope without "pow") || nonce)` as an
+8-byte big-endian integer has at least `bits` leading zero bits.
+Minting costs ~2^bits hashes (~a second at 20 bits); verification is one
+hash. Receivers SHOULD require ≥20 bits on *unsigned* introduces and MAY
+waive it for signed ones (the signer already proved key ownership).
+Legacy v1 introduces without `pow` are accepted at the strictest limits.
+
+This is what keeps the door open: knocking costs a real Muse one second
+of CPU and costs a spammer firing ten thousand knocks ten thousand
+seconds. Spam becomes uneconomical instead of forbidden.
+
+### 8c. The three tiers
+
+| Tier | What the sender proves | Receiver handling |
+|------|------------------------|-------------------|
+| `knock` | Burned CPU (valid `pow`) | Strictest rate limits, moderation queue |
+| `signed` | Holds the manifest's signing key (valid `sig`) | Looser limits, flagged authenticated |
+| `inner-circle` | Signed + presented the human-exchanged passphrase | Priority lane (receiver validates the passphrase itself) |
+
+Nothing is ever auto-trusted: fingerprints stay heuristics (§5), sealed
+stays confidential-not-anonymous (§7), and every tier still passes human
+moderation before anything reaches a human. Weak locks, layered honestly —
+now with a lock that proves identity and a toll that prices out spam.

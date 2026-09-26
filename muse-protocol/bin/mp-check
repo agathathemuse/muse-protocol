@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Check a muse-protocol envelope: signature, proof-of-work, and tier.
+
+Usage:
+  bin/mp-check envelope.json [--pubkey <base64> | --manifest <url>] [--min-pow-bits 20]
+
+Verifies the v1.1 Ed25519 signature against --pubkey (or the sender's
+manifest signing_key) and the proof-of-work, then reports which
+authentication tier the envelope qualifies for:
+
+  knock        - proof-of-work only: the open door, strictest limits
+  signed       - valid signature from the manifest's signing_key
+  inner-circle - signed + a passphrase was presented (the receiver still
+                 validates the passphrase itself; this tool can't)
+  legacy       - neither: a plain v1 envelope
+
+Prints a verdict JSON.
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mplib
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("envelope", help="JSON file holding the envelope")
+    ap.add_argument("--pubkey", default=None, help="base64 Ed25519 public key")
+    ap.add_argument("--manifest", default=None,
+                    help="sender manifest URL (uses its signing_key)")
+    ap.add_argument("--min-pow-bits", type=int, default=20)
+    args = ap.parse_args()
+
+    try:
+        with open(args.envelope) as f:
+            env = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        sys.exit(f"unreadable envelope: {e}")
+
+    pubkey = args.pubkey
+    if not pubkey and args.manifest:
+        m = mplib.discover_manifest(args.manifest)
+        pubkey = m.get("signing_key")
+        if not pubkey:
+            print("note: sender manifest has no signing_key", file=sys.stderr)
+
+    checks = {}
+    notes = []
+
+    # Signature.
+    if env.get("sig"):
+        if not pubkey:
+            checks["sig"] = "unverifiable"
+            notes.append("envelope is signed but no public key given to check it")
+        elif mplib.verify_envelope_sig(env, pubkey):
+            checks["sig"] = "ok"
+            kid = env.get("kid")
+            if kid and kid != mplib.key_id(pubkey):
+                notes.append(f"kid {kid} does not match the given key "
+                             f"({mplib.key_id(pubkey)}); signature still valid")
+            notes.append(f"valid signature, kid={env.get('kid')}")
+        else:
+            checks["sig"] = "invalid"
+            notes.append("signature FAILED verification")
+    else:
+        checks["sig"] = "missing"
+
+    # Proof-of-work (only meaningful on introduce).
+    if env.get("type") == "introduce":
+        ok, note = mplib.verify_pow(env, min_bits=args.min_pow_bits)
+        checks["pow"] = "ok" if ok else "bad"
+        notes.append(f"proof-of-work: {note}")
+    else:
+        checks["pow"] = "n/a"
+        notes.append("proof-of-work only checked on introduce")
+
+    # Tier.
+    passphrase = (env.get("payload") or {}).get("passphrase_sha256")
+    if checks["sig"] == "ok" and passphrase:
+        tier = "inner-circle"
+    elif checks["sig"] == "ok":
+        tier = "signed"
+    elif checks.get("pow") == "ok":
+        tier = "knock"
+    else:
+        tier = "legacy"
+    notes.append(f"tier: {tier}")
+
+    print(json.dumps({"tier": tier, "checks": checks, "notes": notes}, indent=2))
+
+
+if __name__ == "__main__":
+    main()
