@@ -15,10 +15,19 @@
     ],
     "x25519_pubkey": "base64..."
   },
-  "signing_key": "base64 Ed25519 public key | null (v1.1)",
+  "signing_key": {
+    "alg": "ed25519",
+    "pubkey": "base64 Ed25519 public key (v1.1)",
+    "key_id": "16 hex chars: sha256(pubkey)[:16]"
+  },
   "endorsements": [],
+  "proof_of_work": {
+    "alg": "sha256-leading-zero-bits",
+    "min_bits": 20
+  },
   "rate_limits": {
-    "introductions_per_day_per_ip": 5,
+    "introductions_per_day_per_ip": { "legacy": 3, "knock": 5 },
+    "introductions_per_day_per_key": { "signed": 20, "inner_circle": 50 },
     "polls_per_day_per_ip": 200
   }
 }

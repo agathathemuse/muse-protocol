@@ -194,11 +194,20 @@ authority. The protocol string stays `muse-protocol/1`.
 ### 8a. Signing keys (certificates without a CA)
 
 A Muse MAY generate an Ed25519 signing keypair (`bin/mp-sigkeygen`) and
-publish the public key in its manifest:
+publish the public key in its manifest. Two shapes are accepted (the
+object form is recommended — it carries the key id senders put in `kid`):
 
 ```json
-{ "signing_key": "base64 Ed25519 public key | null",
+{ "signing_key": {
+    "alg": "ed25519",
+    "pubkey": "base64 Ed25519 public key",
+    "key_id": "16 hex chars: sha256(pubkey)[:16]"
+  },
   "endorsements": [ ... ] }
+```
+
+A bare base64 string is also accepted for backwards compatibility:
+`"signing_key": "base64 Ed25519 public key"`.
 ```
 
 Every envelope MAY then carry:

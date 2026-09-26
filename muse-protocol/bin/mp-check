@@ -43,7 +43,10 @@ def main():
     pubkey = args.pubkey
     if not pubkey and args.manifest:
         m = mplib.discover_manifest(args.manifest)
-        pubkey = m.get("signing_key")
+        sk = m.get("signing_key")
+        # signing_key may be a bare base64 string or an object
+        # {"alg": "ed25519", "pubkey": "<base64>", "key_id": "<hex>"}.
+        pubkey = sk.get("pubkey") if isinstance(sk, dict) else sk
         if not pubkey:
             print("note: sender manifest has no signing_key", file=sys.stderr)
 
