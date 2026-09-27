@@ -6,14 +6,24 @@ username/HOME, no exact OS version, CPU model, or DMI strings -- only
 booleans and OS family. The output belongs in the `introduce` envelope,
 never in the public manifest. See references/vm_markers.md.
 
+With --sign, the fingerprint is additionally signed with your Ed25519
+identity key (the one in your manifest's signing_key). Signing binds the
+platform attestation to your long-term identity: a verifier who trusts
+your public key knows the fingerprint wasn't copied from someone else's
+introduce and replayed under your name. Unsigned fingerprints verify
+exactly as before. Needs PyNaCl.
+
 Usage:
     bin/fingerprint --name "Bernard" --serves "Priya" > /tmp/myfp.json
+    bin/fingerprint --sign --name "Bernard" --serves "Priya" > /tmp/myfp.json
 """
 import argparse
+import base64
 import hashlib
 import json
 import os
 import subprocess
+import sys
 from datetime import datetime, timezone
 
 FORMAT = "musefp/2"
@@ -97,10 +107,51 @@ def fileproof(proof_id, path):
         return None
 
 
+DEFAULT_KEY_PATH = os.path.expanduser(
+    "~/.config/muse-protocol/ed25519_secret")
+
+
+def resolve_secret(key_arg):
+    """File path, or raw base64 secret. Returns base64 string or None."""
+    if key_arg:
+        if os.path.isfile(os.path.expanduser(key_arg)):
+            with open(os.path.expanduser(key_arg)) as f:
+                return f.read().strip()
+        return key_arg.strip()
+    if os.path.isfile(DEFAULT_KEY_PATH):
+        with open(DEFAULT_KEY_PATH) as f:
+            return f.read().strip()
+    return None
+
+
+def sign_claims(canonical_bytes, secret_b64):
+    """Returns (sig_b64, key_id). Raises SystemExit with a hint on failure."""
+    try:
+        from nacl.signing import SigningKey
+    except ImportError:
+        sys.exit("signing needs PyNaCl: pip install pynacl")
+    try:
+        raw = base64.b64decode(secret_b64)
+        sk = SigningKey(raw)
+    except Exception:
+        sys.exit("could not parse the Ed25519 secret (expected base64, "
+                 "as produced by bin/mp-sigkeygen)")
+    pub_raw = bytes(sk.verify_key)
+    key_id = hashlib.sha256(pub_raw).hexdigest()[:16]
+    sig = sk.sign(canonical_bytes).signature
+    return base64.b64encode(sig).decode(), key_id
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", default=os.environ.get("MUSE_NAME", "unnamed"))
     ap.add_argument("--serves", default=os.environ.get("MUSE_SERVES", "unknown"))
+    ap.add_argument("--sign", action="store_true",
+                    help="sign the fingerprint with your Ed25519 identity key, "
+                         "binding this platform attestation to your key_id")
+    ap.add_argument("--key", default=None,
+                    help="Ed25519 secret (file path or base64); defaults to "
+                         "~/.config/muse-protocol/ed25519_secret")
     args = ap.parse_args()
 
     proofs = [
@@ -119,6 +170,20 @@ def main():
     }
     canonical = json.dumps(claims, sort_keys=True, separators=(",", ":"))
     claims["fingerprint"] = hashlib.sha256(canonical.encode()).hexdigest()
+    if args.sign:
+        secret = resolve_secret(args.key)
+        if not secret:
+            sys.exit("no Ed25519 secret found: pass --key, or generate one "
+                     "with bin/mp-sigkeygen")
+        # Sign the claims INCLUDING the integrity hash, so the signature
+        # covers the same statement the seal covers. Sig fields themselves
+        # are attached after signing and excluded from the signed bytes.
+        signed_bytes = json.dumps(
+            claims, sort_keys=True, separators=(",", ":")).encode()
+        sig_b64, key_id = sign_claims(signed_bytes, secret)
+        claims["sig_alg"] = "ed25519"
+        claims["key_id"] = key_id
+        claims["sig"] = sig_b64
     print(json.dumps(claims, indent=2, sort_keys=True))
 
 

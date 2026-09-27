@@ -31,11 +31,14 @@ import mplib
 from mplib import PROTOCOL
 
 
-def build_fingerprint(name, serves):
+def build_fingerprint(name, serves, sign_secret=None):
     here = os.path.dirname(os.path.abspath(__file__))
-    out = subprocess.run(
-        [os.path.join(here, "fingerprint"), "--name", name, "--serves", serves],
-        capture_output=True, text=True, timeout=30)
+    cmd = [os.path.join(here, "fingerprint"), "--name", name, "--serves", serves]
+    if sign_secret:
+        # Same identity key signs the envelope and the fingerprint, binding
+        # the platform attestation to the signer (see SPEC.md §5).
+        cmd += ["--sign", "--key", sign_secret]
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if out.returncode != 0:
         sys.exit(f"fingerprint failed: {out.stderr.strip()}")
     return json.loads(out.stdout)
@@ -78,7 +81,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--sign", default=None,
                     help="Ed25519 secret (file path or base64) to sign the "
-                         "envelope; defaults to "
+                         "envelope AND the introduce fingerprint; defaults to "
                          "~/.config/muse-protocol/ed25519_secret if present")
     ap.add_argument("--no-pow", action="store_true",
                     help="skip proof-of-work on introduce (minted by default)")
@@ -91,13 +94,20 @@ def main():
 
     manifest = mplib.discover_manifest(args.to)
 
+    # v1.1: resolve the signing key first -- when the envelope is signed,
+    # the introduce fingerprint is signed with the same key.
+    try:
+        sign_secret = resolve_sign_secret(args.sign)
+    except Exception as e:
+        sys.exit(f"--sign secret unreadable: {e}")
+
     if args.type == "introduce":
         payload = {
             "message": args.message,
             "passphrase_sha256": hashlib.sha256(args.passphrase.encode()).hexdigest()
             if args.passphrase else None,
         }
-        fingerprint = build_fingerprint(args.name, args.serves)
+        fingerprint = build_fingerprint(args.name, args.serves, sign_secret)
     else:
         payload = {"text": args.message, "in_reply_to": None}
         fingerprint = None
@@ -131,13 +141,9 @@ def main():
     }
 
     # v1.1: sign first, then proof-of-work over the signed envelope.
-    try:
-        secret = resolve_sign_secret(args.sign)
-    except Exception as e:
-        sys.exit(f"--sign secret unreadable: {e}")
-    if secret:
+    if sign_secret:
         mplib.require_nacl()
-        envelope = mplib.sign_envelope(envelope, secret)
+        envelope = mplib.sign_envelope(envelope, sign_secret)
     if args.type == "introduce" and not args.no_pow:
         envelope["pow"] = mplib.mint_pow(envelope, bits=args.pow_bits)
 

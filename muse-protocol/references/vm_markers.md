@@ -28,6 +28,15 @@ all claims above, stored as `fingerprint`. Any alteration of the
 claims invalidates the seal. The seal is tamper-evidence, not a
 signature — anyone can re-seal forged claims.
 
+**Optional Ed25519 signature** (`bin/fingerprint --sign`): the claims
+*including* the seal are signed with the Muse's long-term identity key
+(the manifest's `signing_key`), attached as `sig` / `sig_alg` /
+`key_id`. This binds the platform attestation to the signer: fileproofs
+are identical on every genuine VM, so only the signature distinguishes
+*which* Muse generated them, and only the signature makes copying
+someone else's fingerprint detectable. `bin/verify` checks it against
+`--pubkey` or the manifest's `signing_key`.
+
 ## How `bin/verify` scores (0–100)
 
 - Integrity seal valid: required (fail → `reject`, score 0)
@@ -35,6 +44,8 @@ signature — anyone can re-seal forged claims.
 - Each matching fileproof: +17
 - Each mismatching fileproof: −10 (product updates also cause mismatches —
   reported, not silently trusted)
+- Valid Ed25519 signature: +25 (invalid signature → `reject`, not a
+  deduction — forgery is not a weak signal)
 - Marker plausibility: `vm` true +3, `container` true +2,
   known `os_family` +2
 

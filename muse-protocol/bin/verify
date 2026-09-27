@@ -5,17 +5,31 @@ Checks integrity (tamper-evidence), freshness, and authenticity: fileproofs
 are recomputed against THIS machine's copies of the bundled files -- only a
 VM with genuine product files can produce matching hashes.
 
+If the fingerprint carries an Ed25519 signature (bin/fingerprint --sign),
+it is verified against a public key you supply (--pubkey) or fetch from the
+signer's manifest (--manifest-url). A valid signature binds the platform
+attestation to the signer's long-term identity key: the claims can't have
+been copied from someone else's introduce and replayed. An invalid
+signature is a forgery attempt and forces a reject verdict.
+
 v1 fingerprints are scored but downgraded: they embed absolute paths,
 usernames, and exact OS/CPU/DMI strings that should never have been public.
 See references/vm_markers.md.
 
-Usage: bin/verify /tmp/theirfp.json
+Usage:
+    bin/verify /tmp/theirfp.json
+    bin/verify --pubkey <base64> /tmp/theirfp.json
+    bin/verify --manifest-url https://example.com/.well-known/muse-protocol.json /tmp/theirfp.json
+
 Prints a verdict JSON: {verdict, score, checks, notes}.
 verdict is one of: likely-muse-vm | uncertain | reject
 """
+import argparse
+import base64
 import hashlib
 import json
 import sys
+import urllib.request
 from datetime import datetime, timezone
 
 KNOWN_OS_FAMILIES = {
@@ -43,12 +57,75 @@ def resolve_local_path(proof):
     return proof.get("path")
 
 
+def manifest_pubkey(url):
+    """Fetch a manifest and return its signing_key public key (base64)."""
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            manifest = json.loads(r.read().decode())
+    except Exception as e:
+        return None, f"could not fetch manifest: {e}"
+    sk = manifest.get("signing_key")
+    if isinstance(sk, dict):
+        pub = sk.get("pubkey")
+    elif isinstance(sk, str):
+        pub = sk  # bare base64 form
+    else:
+        pub = None
+    if not pub:
+        return None, "manifest has no signing_key"
+    return pub, None
+
+
+def key_id_of(pub_b64):
+    try:
+        return hashlib.sha256(base64.b64decode(pub_b64)).hexdigest()[:16]
+    except Exception:
+        return None
+
+
+def check_signature(signed_bytes_note, sig_b64, sig_alg, claimed_kid, pub_b64):
+    """Verify a detached Ed25519 signature.
+
+    signed_bytes_note: canonical bytes that were signed.
+    Returns (True/False/None, note). None = could not check (no PyNaCl).
+    """
+    try:
+        from nacl.signing import VerifyKey
+    except ImportError:
+        return None, ("signature present but PyNaCl not installed; "
+                      "pip install pynacl to verify")
+    if (sig_alg or "ed25519") != "ed25519":
+        return False, "unsupported sig_alg (expected ed25519)"
+    if not sig_b64 or not claimed_kid:
+        return False, "signature block incomplete (missing sig or key_id)"
+    actual_kid = key_id_of(pub_b64)
+    if actual_kid != claimed_kid:
+        return False, (f"key_id mismatch: fingerprint claims {claimed_kid}, "
+                       f"supplied public key is {actual_kid}")
+    try:
+        VerifyKey(base64.b64decode(pub_b64)).verify(
+            signed_bytes_note, base64.b64decode(sig_b64))
+        return True, f"valid Ed25519 signature from key {claimed_kid}"
+    except Exception:
+        return False, (f"INVALID SIGNATURE for claimed key {claimed_kid}: "
+                       "claims were copied or altered after signing")
+
+
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("fingerprint", help="path to the fingerprint JSON")
+    ap.add_argument("--pubkey", default=None,
+                    help="base64 Ed25519 public key to verify a signature against")
+    ap.add_argument("--manifest-url", default=None,
+                    help="fetch the signer's manifest and verify the signature "
+                         "against its signing_key")
+    args = ap.parse_args()
+
     notes = []
     try:
-        with open(sys.argv[1]) as f:
+        with open(args.fingerprint) as f:
             fp = json.load(f)
-    except (IndexError, OSError, json.JSONDecodeError) as e:
+    except (OSError, json.JSONDecodeError) as e:
         print(json.dumps({"verdict": "reject", "score": 0,
                           "notes": [f"unreadable fingerprint: {e}"]}, indent=2))
         return
@@ -72,6 +149,13 @@ def main():
     if isinstance(fp.get("paths"), dict) and any(
             str(k).startswith("/") for k in fp["paths"]):
         notes.append("fingerprint embeds absolute paths; ignored for scoring")
+
+    # Extract the optional signature block BEFORE the integrity check:
+    # sig fields were attached after sealing and are excluded from it.
+    sig_b64 = fp.pop("sig", None)
+    sig_alg = fp.pop("sig_alg", None)
+    claimed_kid = fp.pop("key_id", None)
+    signed = sig_b64 is not None
 
     # 1. Integrity: the sealed hash must match the claims.
     sealed = fp.pop("fingerprint", None)
@@ -133,8 +217,37 @@ def main():
         # v1 exact strings are not trusted for points, only noted above.
         pass
 
+    # 5. Signature: binds the attestation to the signer's long-term key.
+    #    The signed bytes are the claims INCLUDING the integrity seal.
+    sig_status = "absent"
+    if signed:
+        pub_b64 = args.pubkey
+        if not pub_b64 and args.manifest_url:
+            pub_b64, err = manifest_pubkey(args.manifest_url)
+            if err:
+                notes.append(err)
+        if not pub_b64:
+            sig_status = "unverified"
+            notes.append(f"signed by key {claimed_kid}, but no public key "
+                         "supplied: pass --pubkey or --manifest-url to verify")
+        else:
+            signed_obj = dict(fp)
+            signed_obj["fingerprint"] = sealed
+            ok, note = check_signature(canonical(signed_obj), sig_b64,
+                                       sig_alg, claimed_kid, pub_b64)
+            notes.append(note)
+            if ok is True:
+                sig_status = "valid"
+                score += 25
+            elif ok is False:
+                sig_status = "invalid"
+            else:
+                sig_status = "unverified"
+
     score = max(0, min(100, score))
-    if mismatched:
+    if sig_status == "invalid":
+        verdict = "reject"
+    elif mismatched:
         verdict = "uncertain"
     elif score >= 70:
         verdict = "likely-muse-vm"
@@ -153,6 +266,8 @@ def main():
             "fileproofs_matched": matched,
             "fileproofs_mismatched": mismatched,
             "fileproofs_unverifiable": unverifiable,
+            "signature": sig_status,
+            "signed_key_id": claimed_kid,
         },
         "notes": notes,
     }, indent=2))
